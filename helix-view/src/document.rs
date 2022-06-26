@@ -1,6 +1,7 @@
 use anyhow::{anyhow, bail, Context, Error};
 use helix_core::auto_pairs::AutoPairs;
 use helix_core::Range;
+use log;
 use serde::de::{self, Deserialize, Deserializer};
 use serde::Serialize;
 use std::cell::Cell;
@@ -8,8 +9,19 @@ use std::collections::HashMap;
 use std::fmt::Display;
 use std::future::Future;
 use std::path::{Path, PathBuf};
+use std::process::Stdio;
 use std::str::FromStr;
 use std::sync::Arc;
+
+use std::process::ExitStatus;
+
+use tokio::sync::oneshot;
+use tokio::time::timeout;
+
+use std::time::Duration;
+use tokio::io::AsyncReadExt;
+use tokio::io::AsyncWriteExt;
+use tokio::process::Command;
 
 use helix_core::{
     encoding,
@@ -397,7 +409,7 @@ impl Document {
 
     /// The same as [`format`], but only returns formatting changes if auto-formatting
     /// is configured.
-    pub fn auto_format(&self) -> Option<impl Future<Output = LspFormatting> + 'static> {
+    pub fn auto_format(&self) -> Option<impl Future<Output = Transaction> + 'static> {
         if self.language_config()?.auto_format {
             self.format()
         } else {
@@ -407,7 +419,99 @@ impl Document {
 
     /// If supported, returns the changes that should be applied to this document in order
     /// to format it nicely.
-    pub fn format(&self) -> Option<impl Future<Output = LspFormatting> + 'static> {
+    pub fn format(&self) -> Option<impl Future<Output = Transaction> + 'static> {
+        let cmd_fut = self.format_cmd();
+        let lsp_fut = self.format_lsp();
+
+        if lsp_fut.is_none() && cmd_fut.is_none() {
+            return None;
+        }
+
+        Some(async move {
+            if cmd_fut.is_none() {
+                let lsp_formatting = lsp_fut.unwrap().await;
+                Transaction::from(lsp_formatting)
+            } else {
+                cmd_fut.unwrap().await
+            }
+        })
+    }
+
+    fn format_cmd(&self) -> Option<impl Future<Output = Transaction> + 'static> {
+        let formatter_config = self.language_config()?.formatter.as_ref()?;
+
+        let mut args = formatter_config.split_whitespace();
+
+        let cmd = args.next()?;
+
+        let text = self.text.clone();
+        let input: Vec<u8> = text.bytes().collect();
+
+        let mut child = Command::new(cmd)
+            .args(args)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .kill_on_drop(true)
+            .spawn()
+            .unwrap();
+
+        Some(async move {
+            let mut stdin = match child.stdin.take() {
+                Some(stdin) => stdin,
+                None => {
+                    log::warn!("Command formatting failed: Could not get stdin.");
+                    return Default::default();
+                }
+            };
+
+            tokio::spawn(async move {
+                match stdin.write_all(&input).await {
+                    Ok(_) => drop(stdin),
+                    Err(err) => {
+                        log::warn!("Command formatting failed: {}", err);
+                    }
+                };
+            });
+
+            let output = match timeout(Duration::from_millis(5000), child.wait_with_output()).await
+            {
+                Ok(Ok(output)) => output,
+                Ok(Err(err)) => {
+                    log::warn!("Command formatting failed: {}", err);
+                    return Default::default();
+                }
+                Err(_) => {
+                    log::warn!("Command formatting failed: Timed out waiting for stdout.");
+                    return Default::default();
+                }
+            };
+
+            if !output.status.success() {
+                let stderr =
+                    std::str::from_utf8(&output.stderr).unwrap_or("Could not parse stderr.");
+
+                log::warn!("Command formatting failed: {}", stderr);
+
+                return Default::default();
+            }
+
+            let formatted_code = match std::str::from_utf8(&output.stdout) {
+                Ok(v) => v,
+                Err(e) => {
+                    log::warn!(
+                        "Command formatting failed: returned invalid UTF-8 sequence: {}",
+                        e
+                    );
+                    return Default::default();
+                }
+            };
+
+            helix_core::diff::compare_ropes(&text, &Rope::from_str(formatted_code))
+        })
+    }
+
+    fn format_lsp(&self) -> Option<impl Future<Output = LspFormatting> + 'static> {
         let language_server = self.language_server()?;
         let text = self.text.clone();
         let offset_encoding = language_server.offset_encoding();
@@ -442,7 +546,7 @@ impl Document {
 
     pub fn format_and_save(
         &mut self,
-        formatting: Option<impl Future<Output = LspFormatting>>,
+        formatting: Option<impl Future<Output = Transaction>>,
         force: bool,
     ) -> impl Future<Output = anyhow::Result<()>> {
         self.save_impl(formatting, force)
@@ -454,7 +558,7 @@ impl Document {
     /// at its `path()`.
     ///
     /// If `formatting` is present, it supplies some changes that we apply to the text before saving.
-    fn save_impl<F: Future<Output = LspFormatting>>(
+    fn save_impl<F: Future<Output = Transaction>>(
         &mut self,
         formatting: Option<F>,
         force: bool,
@@ -488,7 +592,7 @@ impl Document {
             }
 
             if let Some(fmt) = formatting {
-                let success = Transaction::from(fmt.await).changes().apply(&mut text);
+                let success = (fmt.await).changes().apply(&mut text);
                 if !success {
                     // This shouldn't happen, because the transaction changes were generated
                     // from the same text we're saving.
