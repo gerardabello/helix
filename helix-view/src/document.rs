@@ -13,13 +13,9 @@ use std::process::Stdio;
 use std::str::FromStr;
 use std::sync::Arc;
 
-use std::process::ExitStatus;
-
-use tokio::sync::oneshot;
 use tokio::time::timeout;
 
 use std::time::Duration;
-use tokio::io::AsyncReadExt;
 use tokio::io::AsyncWriteExt;
 use tokio::process::Command;
 
@@ -420,24 +416,25 @@ impl Document {
     /// If supported, returns the changes that should be applied to this document in order
     /// to format it nicely.
     pub fn format(&self) -> Option<impl Future<Output = Transaction> + 'static> {
-        let cmd_fut = self.format_cmd();
+        let cli_fut = self.format_cli();
         let lsp_fut = self.format_lsp();
 
-        if lsp_fut.is_none() && cmd_fut.is_none() {
+        if lsp_fut.is_none() && cli_fut.is_none() {
             return None;
         }
 
         Some(async move {
-            if cmd_fut.is_none() {
+            if cli_fut.is_none() {
                 let lsp_formatting = lsp_fut.unwrap().await;
                 Transaction::from(lsp_formatting)
             } else {
-                cmd_fut.unwrap().await
+                cli_fut.unwrap().await
             }
         })
     }
 
-    fn format_cmd(&self) -> Option<impl Future<Output = Transaction> + 'static> {
+    /// Runs a CLI formatter if the language configuration has one.
+    fn format_cli(&self) -> Option<impl Future<Output = Transaction> + 'static> {
         let formatter_config = self.language_config()?.formatter.as_ref()?;
 
         let mut args = formatter_config.split_whitespace();
@@ -445,72 +442,80 @@ impl Document {
         let cmd = args.next()?;
 
         let text = self.text.clone();
-        let input: Vec<u8> = text.bytes().collect();
 
-        let mut child = Command::new(cmd)
+        match Command::new(cmd)
             .args(args)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             .kill_on_drop(true)
             .spawn()
-            .unwrap();
-
-        Some(async move {
-            let mut stdin = match child.stdin.take() {
-                Some(stdin) => stdin,
-                None => {
-                    log::warn!("Command formatting failed: Could not get stdin.");
-                    return Default::default();
-                }
-            };
-
-            tokio::spawn(async move {
-                match stdin.write_all(&input).await {
-                    Ok(_) => drop(stdin),
-                    Err(err) => {
-                        log::warn!("Command formatting failed: {}", err);
+        {
+            Ok(mut child) => Some(async move {
+                let mut stdin = match child.stdin.take() {
+                    Some(stdin) => stdin,
+                    None => {
+                        log::warn!("Command formatting failed: Could not get stdin.");
+                        return Default::default();
                     }
                 };
-            });
 
-            let output = match timeout(Duration::from_millis(5000), child.wait_with_output()).await
-            {
-                Ok(Ok(output)) => output,
-                Ok(Err(err)) => {
-                    log::warn!("Command formatting failed: {}", err);
+                let input: Vec<u8> = text.bytes().collect();
+
+                tokio::spawn(async move {
+                    match stdin.write_all(&input).await {
+                        Ok(_) => drop(stdin),
+                        Err(err) => {
+                            log::warn!("Command formatting failed: {}", err);
+                        }
+                    };
+                });
+
+                let output = match timeout(Duration::from_secs(5), child.wait_with_output()).await {
+                    Ok(Ok(output)) => output,
+                    Ok(Err(err)) => {
+                        log::warn!("Command formatting failed: {}", err);
+                        return Default::default();
+                    }
+                    Err(_) => {
+                        log::warn!("Command formatting failed: Timed out waiting for stdout.");
+                        return Default::default();
+                    }
+                };
+
+                if !output.status.success() {
+                    let stderr =
+                        std::str::from_utf8(&output.stderr).unwrap_or("Could not parse stderr.");
+
+                    log::warn!("Command formatting failed: {}", stderr);
+
                     return Default::default();
                 }
-                Err(_) => {
-                    log::warn!("Command formatting failed: Timed out waiting for stdout.");
-                    return Default::default();
-                }
-            };
 
-            if !output.status.success() {
-                let stderr =
-                    std::str::from_utf8(&output.stderr).unwrap_or("Could not parse stderr.");
+                let formatted_code = match std::str::from_utf8(&output.stdout) {
+                    Ok(v) => v,
+                    Err(err) => {
+                        log::warn!(
+                            "Command formatting failed: returned invalid UTF-8 sequence: {}",
+                            err
+                        );
+                        return Default::default();
+                    }
+                };
 
-                log::warn!("Command formatting failed: {}", stderr);
-
+                helix_core::diff::compare_ropes(&text, &Rope::from_str(formatted_code))
+            }),
+            Err(err) => {
+                log::warn!(
+                    "Command formatting failed: failed to create Command: {}",
+                    err
+                );
                 return Default::default();
             }
-
-            let formatted_code = match std::str::from_utf8(&output.stdout) {
-                Ok(v) => v,
-                Err(e) => {
-                    log::warn!(
-                        "Command formatting failed: returned invalid UTF-8 sequence: {}",
-                        e
-                    );
-                    return Default::default();
-                }
-            };
-
-            helix_core::diff::compare_ropes(&text, &Rope::from_str(formatted_code))
-        })
+        }
     }
 
+    /// If available, it formats the file with LSP.
     fn format_lsp(&self) -> Option<impl Future<Output = LspFormatting> + 'static> {
         let language_server = self.language_server()?;
         let text = self.text.clone();
